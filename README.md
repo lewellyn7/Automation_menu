@@ -98,7 +98,7 @@
     ```
 2. **国内加速一键运行命令（备用）**：
     ```bash
-    wget -O menu.sh https://ghproxy.net/https://raw.githubusercontent.com/lewellyn7/Automation_menu/main/Automation_menu.sh && chmod +x menu.sh
+    wget -O menu.sh https://ghproxy.net/https://raw.githubusercontent.com/lewellyn7/Automation_menu/main/Automation_menu.sh && chmod +x menu.sh && ./menu.sh
     ```
   
     
