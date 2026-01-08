@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # =================================================================
-#  Linux 服务器运维工具箱 (自定义定时任务版)
-#  更新: 定时任务支持 Daily/Weekly/Monthly 及自定义时间
+#  Linux 服务器运维工具箱 (定时任务增强版)
+#  新增: 命令行参数支持 (实现无人值守运行)
+#  新增: Crontab 定时任务一键配置
 # =================================================================
 
 # 定义颜色
@@ -22,24 +23,27 @@ IS_CONTAINER=0
 CMD_INSTALL=""
 CMD_UPDATE=""
 SVC_CHRONY=""
-CURRENT_SCRIPT=$(readlink -f "$0")
+CURRENT_SCRIPT=$(readlink -f "$0") # 获取当前脚本绝对路径
 
 # --- 0. 环境深度检测 ---
 check_sys() {
+    # 1. 检查 Root 权限
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}错误: 请使用 sudo 或 root 权限运行此脚本！${NC}"
         exit 1
     fi
 
+    # 2. 检测发行版
     if [ -f /etc/os-release ]; then
         source /etc/os-release
         OS_NAME=$ID
         OS_VERSION=$VERSION_ID
     else
-        echo -e "${RED}无法读取 /etc/os-release。${NC}"
+        echo -e "${RED}无法读取 /etc/os-release，无法判断系统类型。${NC}"
         exit 1
     fi
 
+    # 识别包管理器
     if [[ "$OS_NAME" =~ (debian|ubuntu|kali|linuxmint) ]]; then
         OS_TYPE="debian"
         CMD_INSTALL="apt install -y"
@@ -55,6 +59,7 @@ check_sys() {
         exit 1
     fi
 
+    # 3. 检测虚拟化
     if command -v systemd-detect-virt &> /dev/null; then
         VIRT_TYPE=$(systemd-detect-virt)
     else
@@ -88,6 +93,7 @@ sys_update() {
     echo -e "\n${YELLOW}[正在执行] 系统软件包更新 ($OS_TYPE)...${NC}"
     eval $CMD_UPDATE
     $CMD_INSTALL curl wget git jq bc cron
+    # 注意：Debian下叫cron, CentOS下可能叫crontabs或cronie，这里简单尝试安装
     if [ "$OS_TYPE" == "rhel" ]; then $CMD_INSTALL cronie; fi
     echo -e "${GREEN}√ 系统更新完成。${NC}"
 }
@@ -96,7 +102,7 @@ sys_update() {
 enable_bbr() {
     echo -e "\n${YELLOW}[正在执行] 检查并开启 TCP BBR...${NC}"
     if [ "$IS_CONTAINER" -eq 1 ]; then
-        echo -e "${RED}x 容器环境无法修改内核参数，跳过。${NC}"
+        echo -e "${RED}x 容器环境 ($VIRT_TYPE) 无法修改内核参数，跳过。${NC}"
         return
     fi
     if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
@@ -112,6 +118,7 @@ enable_bbr() {
 # 3. 智能 Swap
 smart_swap() {
     echo -e "\n${YELLOW}[正在执行] 智能 Swap 与 ZRAM 优化...${NC}"
+    # A. Swappiness
     echo -e "\n> 1. 调整 Swappiness 为 10..."
     if grep -q "vm.swappiness" /etc/sysctl.conf; then
         sed -i 's/vm.swappiness.*/vm.swappiness = 10/' /etc/sysctl.conf
@@ -121,6 +128,7 @@ smart_swap() {
     sysctl -p >/dev/null 2>&1
     echo -e "${GREEN}√ 已优化。${NC}"
 
+    # B. 物理 Swap
     echo -e "\n> 2. 检查物理 Swap 文件..."
     if [ "$IS_CONTAINER" -eq 1 ]; then
         echo -e "${YELLOW}  容器环境跳过物理 Swap。${NC}"
@@ -149,6 +157,7 @@ smart_swap() {
         fi
     fi
 
+    # C. ZRAM
     echo -e "\n> 3. ZRAM 内存压缩配置..."
     if [[ "$IS_CONTAINER" -eq 1 || "$OS_TYPE" == "rhel" ]]; then
         echo -e "${YELLOW}  容器环境或 RHEL 系统跳过 ZRAM。${NC}"
@@ -248,9 +257,7 @@ clean_system_cache() {
     df -h / | awk 'NR==2 {print $5 " used"}'
 }
 
-# --- 核心逻辑区分 ---
-
-# 9. 手动全量优化
+# 9. 执行所有
 run_all() {
     sys_update
     enable_bbr
@@ -262,147 +269,73 @@ run_all() {
     clean_system_cache
 }
 
-# 10. 每日定时维护 (精简任务)
-cron_tasks() {
-    echo -e "\n${BLUE}>>> 开始执行定时维护...${NC}"
-    sys_update           # 系统更新
-    sync_time            # 时间同步
-    clean_docker_garbage # Docker清理
-    clean_system_cache   # 系统垃圾清理
-    echo -e "${BLUE}>>> 维护任务完成。${NC}"
-}
-
-# 11. 增强版定时任务管理
+# 10. 管理定时任务 (新增功能)
 manage_cron() {
-    echo -e "\n${YELLOW}[配置] 定时自动维护任务 (Crontab)${NC}"
+    echo -e "\n${YELLOW}[正在配置] 自动维护任务 (Crontab)...${NC}"
     
     # 检查脚本路径是否合法
     if [[ "$CURRENT_SCRIPT" == "/dev/fd/"* ]]; then
         echo -e "${RED}警告: 您似乎是直接通过 curl/wget 运行的脚本。${NC}"
-        echo -e "请先将脚本下载并保存到本地（例如 /root/menu.sh），赋予执行权限后再配置定时任务。"
+        echo -e "请先将脚本下载并保存到本地（例如 /root/menu.sh），然后给它赋予执行权限，再运行添加定时任务。"
         return
     fi
+    
+    # 确保有执行权限
     chmod +x "$CURRENT_SCRIPT"
 
-    echo -e "----------------------------------------"
-    echo -e "当前选择的操作:"
-    echo -e "1. ${GREEN}添加/修改${NC} 定时任务"
-    echo -e "2. ${RED}删除${NC} 所有相关任务"
-    echo -e "0. 返回主菜单"
-    echo -e "----------------------------------------"
-    read -p "请输入 [1/2/0]: " action_choice
+    echo -e "请选择操作:"
+    echo -e "1. 添加: 每天凌晨 3:00 自动执行全套优化"
+    echo -e "2. 删除: 取消本脚本的所有定时任务"
+    read -p "请输入 [1/2]: " cron_choice
 
-    # 删除逻辑
-    if [ "$action_choice" == "2" ]; then
+    if [ "$cron_choice" == "1" ]; then
+        # 备份现有 crontab
         crontab -l > /tmp/cron_bkp 2>/dev/null
+        
+        # 删除可能存在的旧任务，防止重复
+        grep -v "$CURRENT_SCRIPT" /tmp/cron_bkp > /tmp/cron_new
+        
+        # 添加新任务 (追加日志到 /var/log/automation_menu.log)
+        echo "0 3 * * * /bin/bash $CURRENT_SCRIPT run_all >> /var/log/automation_menu.log 2>&1" >> /tmp/cron_new
+        
+        # 应用新 crontab
+        crontab /tmp/cron_new
+        rm /tmp/cron_bkp /tmp/cron_new
+        echo -e "${GREEN}√ 定时任务已添加！每天 03:00 自动运行。${NC}"
+        echo -e "  日志文件位置: /var/log/automation_menu.log"
+        
+    elif [ "$cron_choice" == "2" ]; then
+        crontab -l > /tmp/cron_bkp 2>/dev/null
+        # 反向查找并保存
         grep -v "$CURRENT_SCRIPT" /tmp/cron_bkp > /tmp/cron_new
         crontab /tmp/cron_new
         rm /tmp/cron_bkp /tmp/cron_new
-        echo -e "${GREEN}√ 已删除本脚本的所有定时任务。${NC}"
-        return
-    elif [ "$action_choice" == "0" ]; then
-        return
-    elif [ "$action_choice" != "1" ]; then
-        echo -e "${RED}无效输入。${NC}"
-        return
+        echo -e "${GREEN}√ 已移除本脚本的所有定时任务。${NC}"
+    else
+        echo -e "${RED}无效选择。${NC}"
     fi
-
-    # 添加逻辑 - 频率选择
-    echo -e "\n请选择执行频率:"
-    echo -e "1. 每天 (Daily)"
-    echo -e "2. 每周 (Weekly)"
-    echo -e "3. 每月 (Monthly)"
-    read -p "请输入 [1-3]: " freq_choice
-
-    # 时间输入与校验
-    echo -e ""
-    while true; do
-        read -p "请输入执行的小时 (0-23): " cron_hour
-        if [[ "$cron_hour" =~ ^[0-9]+$ ]] && [ "$cron_hour" -ge 0 ] && [ "$cron_hour" -le 23 ]; then break; fi
-        echo -e "${RED}错误: 小时必须是 0-23 之间的数字。${NC}"
-    done
-
-    while true; do
-        read -p "请输入执行的分钟 (0-59): " cron_min
-        if [[ "$cron_min" =~ ^[0-9]+$ ]] && [ "$cron_min" -ge 0 ] && [ "$cron_min" -le 59 ]; then break; fi
-        echo -e "${RED}错误: 分钟必须是 0-59 之间的数字。${NC}"
-    done
-
-    # 构造 Crontab 表达式
-    cron_exp=""
-    desc_str=""
-    cron_dom="*"
-    cron_dow="*"
-
-    case $freq_choice in
-        1) # Daily
-            desc_str="每天 $cron_hour:$cron_min"
-            ;;
-        2) # Weekly
-            while true; do
-                read -p "请输入星期几 (0=周日, 1=周一 ... 6=周六): " cron_dow
-                if [[ "$cron_dow" =~ ^[0-6]$ ]]; then break; fi
-                echo -e "${RED}错误: 请输入 0 到 6 之间的数字。${NC}"
-            done
-            desc_str="每周 (星期$cron_dow) $cron_hour:$cron_min"
-            ;;
-        3) # Monthly
-            while true; do
-                read -p "请输入日期 (1-31): " cron_dom
-                if [[ "$cron_dom" =~ ^[0-9]+$ ]] && [ "$cron_dom" -ge 1 ] && [ "$cron_dom" -le 31 ]; then break; fi
-                echo -e "${RED}错误: 请输入 1 到 31 之间的数字。${NC}"
-            done
-            desc_str="每月 $cron_dom 号 $cron_hour:$cron_min"
-            ;;
-        *)
-            echo -e "${RED}无效选择。${NC}"
-            return
-            ;;
-    esac
-
-    # 组合最终 Cron 表达式
-    cron_exp="$cron_min $cron_hour $cron_dom * $cron_dow"
-
-    # 写入 Crontab
-    crontab -l > /tmp/cron_bkp 2>/dev/null
-    # 先清理旧任务，避免堆积
-    grep -v "$CURRENT_SCRIPT" /tmp/cron_bkp > /tmp/cron_new
-    
-    # 写入新任务
-    echo "$cron_exp /bin/bash $CURRENT_SCRIPT cron_daily >> /var/log/automation_menu.log 2>&1" >> /tmp/cron_new
-    
-    crontab /tmp/cron_new
-    rm /tmp/cron_bkp /tmp/cron_new
-
-    echo -e "${GREEN}√ 定时任务设置成功！${NC}"
-    echo -e "  执行策略: ${YELLOW}$desc_str${NC}"
-    echo -e "  执行内容: 系统更新 + 时间同步 + Docker清理 + 系统清理"
-    echo -e "  日志文件: /var/log/automation_menu.log"
 }
 
 # --- 主逻辑入口 ---
 
+# 0. 优先执行环境检查
 check_sys
 
-# 命令行参数入口: cron_daily (Crontab 专用)
-if [ "$1" == "cron_daily" ]; then
-    date
-    cron_tasks
-    exit 0
-fi
-
-# 命令行参数入口: run_all (手动全量)
+# 逻辑分支: 判断是否有命令行参数
+# 如果运行 ./menu.sh run_all，则直接执行 run_all 函数并退出，不显示菜单
 if [ "$1" == "run_all" ]; then
+    echo -e "${BLUE}>>> 检测到自动运行参数，开始执行全套维护任务...${NC}"
     date
     run_all
+    echo -e "${BLUE}>>> 所有自动任务执行完毕。${NC}"
     exit 0
 fi
 
-# 交互式菜单
+# 如果没有参数，则显示交互式菜单
 show_menu() {
     clear
     echo -e "${BLUE}======================================================${NC}"
-    echo -e "${BLUE}    🚀 Linux 全能运维工具箱 (自定义定时版)   ${NC}"
+    echo -e "${BLUE}    🚀 Linux 全能运维工具箱 (定时任务增强版)   ${NC}"
     echo -e "${BLUE}======================================================${NC}"
     echo -e " 💻  系统:  ${GREEN}${OS_NAME} ${OS_VERSION}${NC} (${OS_TYPE})"
     echo -e " 📦  环境:  ${VIRT_DISPLAY}"
@@ -415,8 +348,8 @@ show_menu() {
     echo -e "${GREEN}6.${NC} 限制 Docker 日志大小"
     echo -e "${GREEN}7.${NC} Docker 强力清理 (镜像/容器/卷)"
     echo -e "${GREEN}8.${NC} 系统垃圾清理 (缓存/日志)"
-    echo -e "${YELLOW}9. 手动执行所有优化 (全套)${NC}"
-    echo -e "${CYAN}10. 设置定时维护任务 (自定义频率/时间)${NC}"
+    echo -e "${YELLOW}9. 执行以上所有优化 (Run All)${NC}"
+    echo -e "${CYAN}10. 设置定时自动运行 (Crontab)${NC}"
     echo -e "${BLUE}======================================================${NC}"
     echo -e "${RED}0. 退出脚本${NC}"
     echo -e "${BLUE}======================================================${NC}"
