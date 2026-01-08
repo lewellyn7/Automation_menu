@@ -1,9 +1,8 @@
 #!/bin/bash
 
 # =================================================================
-#  Linux 服务器运维工具箱 (终极全能版)
-#  支持: Debian/CentOS/RHEL & KVM/LXC/Docker
-#  新增: 独立的强力 Docker 清理模块
+#  Linux 服务器运维工具箱 (定制维护版)
+#  修改点: 定时任务仅执行 更新+同步+Docker清理+系统清理
 # =================================================================
 
 # 定义颜色
@@ -23,26 +22,24 @@ IS_CONTAINER=0
 CMD_INSTALL=""
 CMD_UPDATE=""
 SVC_CHRONY=""
+CURRENT_SCRIPT=$(readlink -f "$0")
 
 # --- 0. 环境深度检测 ---
 check_sys() {
-    # 1. 检查 Root 权限
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}错误: 请使用 sudo 或 root 权限运行此脚本！${NC}"
         exit 1
     fi
 
-    # 2. 检测发行版
     if [ -f /etc/os-release ]; then
         source /etc/os-release
         OS_NAME=$ID
         OS_VERSION=$VERSION_ID
     else
-        echo -e "${RED}无法读取 /etc/os-release，无法判断系统类型。${NC}"
+        echo -e "${RED}无法读取 /etc/os-release。${NC}"
         exit 1
     fi
 
-    # 识别包管理器
     if [[ "$OS_NAME" =~ (debian|ubuntu|kali|linuxmint) ]]; then
         OS_TYPE="debian"
         CMD_INSTALL="apt install -y"
@@ -58,7 +55,6 @@ check_sys() {
         exit 1
     fi
 
-    # 3. 检测虚拟化
     if command -v systemd-detect-virt &> /dev/null; then
         VIRT_TYPE=$(systemd-detect-virt)
     else
@@ -91,7 +87,8 @@ pause() {
 sys_update() {
     echo -e "\n${YELLOW}[正在执行] 系统软件包更新 ($OS_TYPE)...${NC}"
     eval $CMD_UPDATE
-    $CMD_INSTALL curl wget git jq bc
+    $CMD_INSTALL curl wget git jq bc cron
+    if [ "$OS_TYPE" == "rhel" ]; then $CMD_INSTALL cronie; fi
     echo -e "${GREEN}√ 系统更新完成。${NC}"
 }
 
@@ -99,7 +96,7 @@ sys_update() {
 enable_bbr() {
     echo -e "\n${YELLOW}[正在执行] 检查并开启 TCP BBR...${NC}"
     if [ "$IS_CONTAINER" -eq 1 ]; then
-        echo -e "${RED}x 容器环境 ($VIRT_TYPE) 无法修改内核参数，跳过。${NC}"
+        echo -e "${RED}x 容器环境无法修改内核参数，跳过。${NC}"
         return
     fi
     if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
@@ -115,7 +112,6 @@ enable_bbr() {
 # 3. 智能 Swap
 smart_swap() {
     echo -e "\n${YELLOW}[正在执行] 智能 Swap 与 ZRAM 优化...${NC}"
-    # A. Swappiness
     echo -e "\n> 1. 调整 Swappiness 为 10..."
     if grep -q "vm.swappiness" /etc/sysctl.conf; then
         sed -i 's/vm.swappiness.*/vm.swappiness = 10/' /etc/sysctl.conf
@@ -125,7 +121,6 @@ smart_swap() {
     sysctl -p >/dev/null 2>&1
     echo -e "${GREEN}√ 已优化。${NC}"
 
-    # B. 物理 Swap
     echo -e "\n> 2. 检查物理 Swap 文件..."
     if [ "$IS_CONTAINER" -eq 1 ]; then
         echo -e "${YELLOW}  容器环境跳过物理 Swap。${NC}"
@@ -154,7 +149,6 @@ smart_swap() {
         fi
     fi
 
-    # C. ZRAM
     echo -e "\n> 3. ZRAM 内存压缩配置..."
     if [[ "$IS_CONTAINER" -eq 1 || "$OS_TYPE" == "rhel" ]]; then
         echo -e "${YELLOW}  容器环境或 RHEL 系统跳过 ZRAM。${NC}"
@@ -230,52 +224,33 @@ EOF
     fi
 }
 
-# 7. Docker 强力清理 (新增功能)
+# 7. Docker 强力清理
 clean_docker_garbage() {
     echo -e "\n${YELLOW}[正在执行] Docker 强力清理...${NC}"
     if ! command -v docker &> /dev/null; then
         echo -e "${RED}x 未安装 Docker，无法清理。${NC}"
         return
     fi
-    
-    echo -e "${CYAN}即将执行的操作:${NC}"
-    echo "1. 删除所有已停止的容器"
-    echo "2. 删除所有未使用的网络"
-    echo "3. 删除所有未被使用的镜像 (不仅是 dangling)"
-    echo "4. 删除所有构建缓存"
-    echo "5. 删除所有未使用的 Volume 卷 (数据卷)"
-    echo -e "${RED}警告: 这将彻底清理 Docker 空间，请确保没有重要数据在未运行的容器或卷中！${NC}"
-    
-    # 执行清理
-    echo -e "\n正在清理..."
-    # -a: 清理所有未使用镜像, --volumes: 清理未使用卷, -f: 强制不确认
     docker system prune -a --volumes -f
-    
     echo -e "${GREEN}√ Docker 清理完毕。${NC}"
-    # 显示当前 Docker 占用
-    docker system df
 }
 
-# 8. 系统缓存清理 (与 Docker 分离)
+# 8. 系统缓存清理
 clean_system_cache() {
     echo -e "\n${YELLOW}[正在执行] 操作系统缓存清理...${NC}"
-    
-    # 包管理器清理
     if [ "$OS_TYPE" == "debian" ]; then
         apt autoremove -y && apt clean
     elif [ "$OS_TYPE" == "rhel" ]; then
         yum autoremove -y && yum clean all
     fi
-    
-    # 日志清理
     journalctl --vacuum-size=100M > /dev/null 2>&1
-    
     echo -e "${GREEN}√ 系统清理完毕。${NC}"
-    echo -e "当前磁盘使用情况:"
     df -h / | awk 'NR==2 {print $5 " used"}'
 }
 
-# 9. 执行所有
+# --- 核心逻辑区分 ---
+
+# 9. 手动全量优化 (包含 BBR, Swap 等所有功能)
 run_all() {
     sys_update
     enable_bbr
@@ -283,17 +258,85 @@ run_all() {
     sync_time
     install_docker
     limit_docker_logs
-    clean_docker_garbage  # 包含 Docker 清理
-    clean_system_cache    # 包含系统清理
+    clean_docker_garbage
+    clean_system_cache
 }
 
-# --- 主逻辑 ---
+# 10. 每日定时维护 (仅包含你要求的 4 个轻量操作)
+cron_tasks() {
+    echo -e "\n${BLUE}>>> 开始执行每日定时维护...${NC}"
+    sys_update           # 1. 系统更新
+    sync_time            # 2. 时间同步
+    clean_docker_garbage # 3. Docker清理
+    clean_system_cache   # 4. 系统垃圾清理
+    echo -e "${BLUE}>>> 每日维护完成。${NC}"
+}
+
+# 11. 管理定时任务
+manage_cron() {
+    echo -e "\n${YELLOW}[正在配置] 自动维护任务 (Crontab)...${NC}"
+    
+    if [[ "$CURRENT_SCRIPT" == "/dev/fd/"* ]]; then
+        echo -e "${RED}警告: 您似乎是直接通过 curl/wget 运行的脚本。${NC}"
+        echo -e "请先将脚本下载并保存到本地（例如 /root/menu.sh），然后给它赋予执行权限。"
+        return
+    fi
+    chmod +x "$CURRENT_SCRIPT"
+
+    echo -e "请选择操作:"
+    echo -e "1. 添加: 每天凌晨 3:00 自动执行 [更新+同步+清理]"
+    echo -e "2. 删除: 取消本脚本的所有定时任务"
+    read -p "请输入 [1/2]: " cron_choice
+
+    if [ "$cron_choice" == "1" ]; then
+        crontab -l > /tmp/cron_bkp 2>/dev/null
+        grep -v "$CURRENT_SCRIPT" /tmp/cron_bkp > /tmp/cron_new
+        
+        # 注意：这里调用的是 cron_daily 参数，触发精简维护
+        echo "0 3 * * * /bin/bash $CURRENT_SCRIPT cron_daily >> /var/log/automation_menu.log 2>&1" >> /tmp/cron_new
+        
+        crontab /tmp/cron_new
+        rm /tmp/cron_bkp /tmp/cron_new
+        echo -e "${GREEN}√ 定时任务已添加！每天 03:00 自动运行。${NC}"
+        echo -e "  包含内容: 系统更新, 时间同步, Docker清理, 系统清理"
+        echo -e "  日志文件: /var/log/automation_menu.log"
+        
+    elif [ "$cron_choice" == "2" ]; then
+        crontab -l > /tmp/cron_bkp 2>/dev/null
+        grep -v "$CURRENT_SCRIPT" /tmp/cron_bkp > /tmp/cron_new
+        crontab /tmp/cron_new
+        rm /tmp/cron_bkp /tmp/cron_new
+        echo -e "${GREEN}√ 已移除本脚本的所有定时任务。${NC}"
+    else
+        echo -e "${RED}无效选择。${NC}"
+    fi
+}
+
+# --- 主逻辑入口 ---
+
 check_sys
 
+# 命令行参数入口: cron_daily
+# 专门给 Crontab 用的入口，只执行精简任务
+if [ "$1" == "cron_daily" ]; then
+    date
+    cron_tasks
+    exit 0
+fi
+
+# 命令行参数入口: run_all
+# 如果你需要全量执行，也可以用这个参数
+if [ "$1" == "run_all" ]; then
+    date
+    run_all
+    exit 0
+fi
+
+# 交互式菜单
 show_menu() {
     clear
     echo -e "${BLUE}======================================================${NC}"
-    echo -e "${BLUE}    🚀 Linux 全能运维工具箱 (Universal Edition)   ${NC}"
+    echo -e "${BLUE}    🚀 Linux 全能运维工具箱 (定制维护版)   ${NC}"
     echo -e "${BLUE}======================================================${NC}"
     echo -e " 💻  系统:  ${GREEN}${OS_NAME} ${OS_VERSION}${NC} (${OS_TYPE})"
     echo -e " 📦  环境:  ${VIRT_DISPLAY}"
@@ -306,7 +349,8 @@ show_menu() {
     echo -e "${GREEN}6.${NC} 限制 Docker 日志大小"
     echo -e "${GREEN}7.${NC} Docker 强力清理 (镜像/容器/卷)"
     echo -e "${GREEN}8.${NC} 系统垃圾清理 (缓存/日志)"
-    echo -e "${YELLOW}9. 执行以上所有优化${NC}"
+    echo -e "${YELLOW}9. 手动执行所有优化 (全套)${NC}"
+    echo -e "${CYAN}10. 设置每日定时任务 (仅更新+同步+清理)${NC}"
     echo -e "${BLUE}======================================================${NC}"
     echo -e "${RED}0. 退出脚本${NC}"
     echo -e "${BLUE}======================================================${NC}"
@@ -314,7 +358,7 @@ show_menu() {
 
 while true; do
     show_menu
-    read -p "请输入数字选择功能 [0-9]: " choice
+    read -p "请输入数字选择功能 [0-10]: " choice
     
     case $choice in
         1) sys_update; pause ;;
@@ -326,6 +370,7 @@ while true; do
         7) clean_docker_garbage; pause ;;
         8) clean_system_cache; pause ;;
         9) run_all; pause ;;
+        10) manage_cron; pause ;;
         0) echo -e "\n👋 再见！"; exit 0 ;;
         *) echo -e "\n${RED}无效输入！${NC}"; sleep 1 ;;
     esac
